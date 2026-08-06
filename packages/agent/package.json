@@ -43,7 +43,6 @@
     "eslint": "eslint --ext '.js,.jsx,.ts,.tsx' src/index.ts src/auth.ts src/request_id.ts src/request_id.test.ts",
     "lint": "npm run eslint",
     "make:docs/reference": "typedoc src/index.ts --out ../../docs/generated/agent --excludeInternal",
-    "release": "npm publish",
     "test": "jest --verbose",
     "test:coverage": "jest --verbose --collectCoverage",
     "tslint:fix": "npm run lint -- --fix",
@@ -54,6 +53,7 @@
     "@dfinity/principal": "^0.19.3"
   },
   "dependencies": {
+    "@noble/curves": "^1.2.0",
     "@noble/hashes": "^1.3.1",
     "base64-arraybuffer": "^0.2.0",
     "borc": "^2.1.1",

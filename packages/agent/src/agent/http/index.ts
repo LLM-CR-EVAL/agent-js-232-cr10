@@ -3,8 +3,8 @@ import { Principal } from '@dfinity/principal';
 import { AgentError } from '../../errors';
 import { AnonymousIdentity, Identity } from '../../auth';
 import * as cbor from '../../cbor';
-import { requestIdOf } from '../../request_id';
-import { fromHex } from '../../utils/buffer';
+import { hashOfMap, requestIdOf } from '../../request_id';
+import { concat, fromHex } from '../../utils/buffer';
 import {
   Agent,
   ApiQueryResponse,
@@ -27,8 +27,10 @@ import {
   SubmitRequestType,
 } from './types';
 import { AgentHTTPResponseError } from './errors';
-import { request } from '../../canisterStatus';
-import { SubnetStatus } from '../../certificate';
+import { SubnetStatus, request } from '../../canisterStatus';
+import { CertificateVerificationError } from '../../certificate';
+import { ed25519 } from '@noble/curves/ed25519';
+import { Ed25519PublicKey } from '../../public_key';
 
 export * from './transforms';
 export { Nonce, makeNonce } from './types';
@@ -103,23 +105,25 @@ export interface HttpAgentOptions {
     password?: string;
   };
   /**
-   * Prevents the agent from providing a unique {@link Nonce} with each call.
-   * Enabling may cause rate limiting of identical requests
-   * at the boundary nodes.
+   * Adds a unique {@link Nonce} with each query.
+   * Enabling will prevent queries from being answered with a cached response.
    *
-   * To add your own nonce generation logic, you can use the following:
    * @example
-   * import {makeNonceTransform, makeNonce} from '@dfinity/agent';
-   * const agent = new HttpAgent({ disableNonce: true });
+   * const agent = new HttpAgent({ useQueryNonces: true });
    * agent.addTransform(makeNonceTransform(makeNonce);
    * @default false
    */
-  disableNonce?: boolean;
+  useQueryNonces?: boolean;
   /**
    * Number of times to retry requests before throwing an error
    * @default 3
    */
   retryTimes?: number;
+  /**
+   * Whether the agent should verify signatures signed by node keys on query responses. Increases security, but adds overhead and must make a separate request to cache the node keys for the canister's subnet.
+   * @default true
+   */
+  verifyQuerySignatures?: boolean;
 }
 
 function getDefaultFetch(): typeof fetch {
@@ -168,7 +172,6 @@ function getDefaultFetch(): typeof fetch {
 // allowing extensions.
 export class HttpAgent implements Agent {
   public rootKey = fromHex(IC_ROOT_KEY);
-  private readonly _pipeline: HttpAgentRequestTransformFn[] = [];
   private _identity: Promise<Identity> | null;
   private readonly _fetch: typeof fetch;
   private readonly _fetchOptions?: Record<string, unknown>;
@@ -180,14 +183,17 @@ export class HttpAgent implements Agent {
   private readonly _retryTimes; // Retry requests N times before erroring by default
   public readonly _isAgent = true;
 
+  #queryPipeline: HttpAgentRequestTransformFn[] = [];
+  #updatePipeline: HttpAgentRequestTransformFn[] = [];
+
   #subnetKeys: Map<string, SubnetStatus> = new Map();
+  #verifyQuerySignatures = true;
 
   constructor(options: HttpAgentOptions = {}) {
     if (options.source) {
       if (!(options.source instanceof HttpAgent)) {
         throw new Error("An Agent's source can only be another HttpAgent");
       }
-      this._pipeline = [...options.source._pipeline];
       this._identity = options.source._identity;
       this._fetch = options.source._fetch;
       this._host = options.source._host;
@@ -215,7 +221,7 @@ export class HttpAgent implements Agent {
         );
       }
       // Mainnet and local will have the api route available
-      const knownHosts = ['ic0.app', 'icp0.io', 'localhost', '127.0.0.1'];
+      const knownHosts = ['ic0.app', 'icp0.io', '127.0.0.1', '127.0.0.1'];
       const hostname = location?.hostname;
       let knownHost;
       if (hostname && typeof hostname === 'string') {
@@ -233,6 +239,9 @@ export class HttpAgent implements Agent {
           'Could not infer host from window.location, defaulting to mainnet gateway of https://icp-api.io. Please provide a host to the HttpAgent constructor to avoid this warning.',
         );
       }
+    }
+    if (options.verifyQuerySignatures !== undefined) {
+      this.#verifyQuerySignatures = options.verifyQuerySignatures;
     }
     // Default is 3, only set from option if greater or equal to 0
     this._retryTimes =
@@ -253,20 +262,39 @@ export class HttpAgent implements Agent {
     this._identity = Promise.resolve(options.identity || new AnonymousIdentity());
 
     // Add a nonce transform to ensure calls are unique
-    if (!options.disableNonce) {
-      this.addTransform(makeNonceTransform(makeNonce));
+    this.addTransform('update', makeNonceTransform(makeNonce));
+    if (options.useQueryNonces) {
+      this.addTransform('query', makeNonceTransform(makeNonce));
     }
   }
 
   public isLocal(): boolean {
     const hostname = this._host.hostname;
-    return hostname === '127.0.0.1' || hostname.endsWith('localhost');
+    return hostname === '127.0.0.1' || hostname.endsWith('127.0.0.1');
   }
 
-  public addTransform(fn: HttpAgentRequestTransformFn, priority = fn.priority || 0): void {
-    // Keep the pipeline sorted at all time, by priority.
-    const i = this._pipeline.findIndex(x => (x.priority || 0) < priority);
-    this._pipeline.splice(i >= 0 ? i : this._pipeline.length, 0, Object.assign(fn, { priority }));
+  public addTransform(
+    type: 'update' | 'query',
+    fn: HttpAgentRequestTransformFn,
+    priority = fn.priority || 0,
+  ): void {
+    if (type === 'update') {
+      // Keep the pipeline sorted at all time, by priority.
+      const i = this.#updatePipeline.findIndex(x => (x.priority || 0) < priority);
+      this.#updatePipeline.splice(
+        i >= 0 ? i : this.#updatePipeline.length,
+        0,
+        Object.assign(fn, { priority }),
+      );
+    } else if (type === 'query') {
+      // Keep the pipeline sorted at all time, by priority.
+      const i = this.#queryPipeline.findIndex(x => (x.priority || 0) < priority);
+      this.#queryPipeline.splice(
+        i >= 0 ? i : this.#queryPipeline.length,
+        0,
+        Object.assign(fn, { priority }),
+      );
+    }
   }
 
   public async getPrincipal(): Promise<Principal> {
@@ -407,63 +435,176 @@ export class HttpAgent implements Agent {
     fields: QueryFields,
     identity?: Identity | Promise<Identity>,
   ): Promise<ApiQueryResponse> {
-    const id = await (identity !== undefined ? await identity : await this._identity);
-    if (!id) {
-      throw new IdentityInvalidError(
-        "This identity has expired due this application's security policy. Please refresh your authentication.",
-      );
-    }
+    const makeQuery = async () => {
+      const id = await (identity !== undefined ? await identity : await this._identity);
+      if (!id) {
+        throw new IdentityInvalidError(
+          "This identity has expired due this application's security policy. Please refresh your authentication.",
+        );
+      }
 
-    const canister = typeof canisterId === 'string' ? Principal.fromText(canisterId) : canisterId;
-    const sender = id?.getPrincipal() || Principal.anonymous();
+      const canister = Principal.from(canisterId);
+      const sender = id?.getPrincipal() || Principal.anonymous();
 
-    const request: QueryRequest = {
-      request_type: ReadRequestType.Query,
-      canister_id: canister,
-      method_name: fields.methodName,
-      arg: fields.arg,
-      sender,
-      ingress_expiry: new Expiry(DEFAULT_INGRESS_EXPIRY_DELTA_IN_MSECS),
-    };
+      const request: QueryRequest = {
+        request_type: ReadRequestType.Query,
+        canister_id: canister,
+        method_name: fields.methodName,
+        arg: fields.arg,
+        sender,
+        ingress_expiry: new Expiry(DEFAULT_INGRESS_EXPIRY_DELTA_IN_MSECS),
+      };
 
-    // TODO: remove this any. This can be a Signed or UnSigned request.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let transformedRequest: any = await this._transform({
-      request: {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/cbor',
-          ...(this._credentials ? { Authorization: 'Basic ' + btoa(this._credentials) } : {}),
+      const requestId = await requestIdOf(request);
+
+      // TODO: remove this any. This can be a Signed or UnSigned request.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let transformedRequest: any = await this._transform({
+        request: {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/cbor',
+            ...(this._credentials ? { Authorization: 'Basic ' + btoa(this._credentials) } : {}),
+          },
         },
-      },
-      endpoint: Endpoint.Query,
-      body: request,
+        endpoint: Endpoint.Query,
+        body: request,
+      });
+
+      // Apply transform for identity.
+      transformedRequest = await id?.transformRequest(transformedRequest);
+
+      const body = cbor.encode(transformedRequest.body);
+
+      const response = await this._requestAndRetry(() =>
+        this._fetch('' + new URL(`/api/v2/canister/${canister.toText()}/query`, this._host), {
+          ...this._fetchOptions,
+          ...transformedRequest.request,
+          body,
+        }),
+      );
+
+      const queryResponse: QueryResponse = cbor.decode(await response.arrayBuffer());
+
+      return {
+        ...queryResponse,
+        httpDetails: {
+          ok: response.ok,
+          status: response.status,
+          statusText: response.statusText,
+          headers: httpHeadersTransform(response.headers),
+        },
+        requestId,
+      };
+    };
+    const queryPromise = new Promise<ApiQueryResponse>((resolve, reject) => {
+      makeQuery()
+        .then(response => {
+          resolve(response);
+        })
+        .catch(error => {
+          reject(error);
+        });
     });
 
-    // Apply transform for identity.
-    transformedRequest = await id?.transformRequest(transformedRequest);
-
-    const body = cbor.encode(transformedRequest.body);
-    const response = await this._requestAndRetry(() =>
-      this._fetch('' + new URL(`/api/v2/canister/${canister.toText()}/query`, this._host), {
-        ...this._fetchOptions,
-        ...transformedRequest.request,
-        body,
-      }),
-    );
-
-    const queryResponse: QueryResponse = cbor.decode(await response.arrayBuffer());
-
-    return {
-      ...queryResponse,
-      httpDetails: {
-        ok: response.ok,
-        status: response.status,
-        statusText: response.statusText,
-        headers: httpHeadersTransform(response.headers),
-      },
-    };
+    const subnetStatusPromise = new Promise<SubnetStatus | void>((resolve, reject) => {
+      if (!this.#verifyQuerySignatures) {
+        resolve(undefined);
+      }
+      const subnetStatus = this.#subnetKeys.get(canisterId.toString());
+      if (subnetStatus) {
+        resolve(subnetStatus);
+      } else {
+        this.fetchSubnetKeys(canisterId)
+          .then(response => {
+            resolve(response);
+          })
+          .catch(error => {
+            reject(error);
+          });
+      }
+    });
+    const [query, subnetStatus] = await Promise.all([queryPromise, subnetStatusPromise]);
+    // Skip verification if the user has disabled it
+    if (!this.#verifyQuerySignatures) {
+      return query;
+    }
+    return this.#verifyQueryResponse(query, subnetStatus);
   }
+
+  /**
+   * See https://internetcomputer.org/docs/current/references/ic-interface-spec/#http-query for details on validation
+   * @param queryResponse - The response from the query
+   * @param subnetStatus - The subnet status, including all node keys
+   * @returns ApiQueryResponse
+   */
+  #verifyQueryResponse = (
+    queryResponse: ApiQueryResponse,
+    subnetStatus: SubnetStatus | void,
+  ): ApiQueryResponse => {
+    if (this.#verifyQuerySignatures === false) {
+      // This should not be called if the user has disabled verification
+      return queryResponse;
+    }
+    if (!subnetStatus) {
+      throw new CertificateVerificationError(
+        'Invalid signature from replica signed query: no matching node key found.',
+      );
+    }
+    const { status, signatures, requestId } = queryResponse;
+
+    const domainSeparator = new TextEncoder().encode('\x0Bic-response');
+    signatures?.forEach(sig => {
+      const { timestamp, identity } = sig;
+      const nodeId = Principal.fromUint8Array(identity).toText();
+      let hash: ArrayBuffer;
+
+      // Hash is constructed differently depending on the status
+      if (status === 'replied') {
+        const { reply } = queryResponse;
+        hash = hashOfMap({
+          status: status,
+          reply: reply,
+          timestamp: BigInt(timestamp),
+          request_id: requestId,
+        });
+      } else if (status === 'rejected') {
+        const { reject_code, reject_message, error_code } = queryResponse;
+        hash = hashOfMap({
+          status: status,
+          reject_code: reject_code,
+          reject_message: reject_message,
+          error_code: error_code,
+          timestamp: BigInt(timestamp),
+          request_id: requestId,
+        });
+      } else {
+        throw new Error(`Unknown status: ${status}`);
+      }
+
+      const separatorWithHash = concat(domainSeparator, new Uint8Array(hash));
+
+      // FIX: check for match without verifying N times
+      const pubKey = subnetStatus?.nodeKeys.get(nodeId);
+      if (!pubKey) {
+        throw new CertificateVerificationError(
+          'Invalid signature from replica signed query: no matching node key found.',
+        );
+      }
+      const rawKey = Ed25519PublicKey.fromDer(pubKey).rawKey;
+      const valid = ed25519.verify(
+        sig.signature,
+        new Uint8Array(separatorWithHash),
+        new Uint8Array(rawKey),
+      );
+      if (valid) return queryResponse;
+
+      throw new CertificateVerificationError(
+        `Invalid signature from replica ${nodeId} signed query.`,
+      );
+    });
+    return queryResponse;
+  };
 
   public async createReadStateRequest(
     fields: ReadStateOptions,
@@ -609,9 +750,14 @@ export class HttpAgent implements Agent {
 
   protected _transform(request: HttpAgentRequest): Promise<HttpAgentRequest> {
     let p = Promise.resolve(request);
-
-    for (const fn of this._pipeline) {
-      p = p.then(r => fn(r).then(r2 => r2 || r));
+    if (request.endpoint === Endpoint.Call) {
+      for (const fn of this.#updatePipeline) {
+        p = p.then(r => fn(r).then(r2 => r2 || r));
+      }
+    } else {
+      for (const fn of this.#queryPipeline) {
+        p = p.then(r => fn(r).then(r2 => r2 || r));
+      }
     }
 
     return p;

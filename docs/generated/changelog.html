@@ -12,6 +12,45 @@
     <section>
       <h2>Version x.x.x</h2>
       <ul>
+        <ul>
+          <strong>feat!: node signature verification</strong
+          ><br />
+          This feature includes additional changes in support of testing and releasing the feature:
+          <br />
+          <li>Mainnet e2e tests for queries and calls</li>
+          <li>published counter canister</li>
+          <li>
+            New HttpAgent option - verifyQuerySignatures. Defaults to true, but allows you to opt
+            out of verification. Useful for testing against older replica versions
+          </li>
+          <li>Introducing ed25519 logic to agent for validating node signatures</li>
+          <li>Standardizing around @noble/curves instead of tweetnacl in @dfinity/identity</li>
+          <li>
+            new export - hashOfMap from agent, matching the naming used in the interface
+            specification
+          </li>
+          <li>new unit tests</li>
+          <li>new Verify export on ed25519 because why not</li>
+        </ul>
+        <li>Adds support for Uint8Arrays in Principal.from()</li>
+        <li>
+          chore: increases size limit for agent-js to allow for Ed25519 support for node key
+          signature verification
+        </li>
+        <li>
+          feat!: replaces disableNonce feature with useQueryNonces. Going forward, updates will use
+          nonces, but queries and readstate calls will not. Queries and readsatate calls will use
+          nonces if `useQueryNonces` is set to true
+        </li>
+        <li>feat: adds subnet metrics decoding to canisterStatus for `/subnet` path</li>
+        <li>
+          feat!: sets expiry to 1 minute less than the configured expiry, and then down to the
+          nearest second. This matches existing behaviour, but adds the rounding
+        </li>
+        <li>
+          chore: replaces use of localhost with 127.0.0.1 for better node 18 support. Also swaps
+          Jest for vitest, runs mitm against mainnet, and updates some packages
+        </li>
         <li>feat: retry logic will catch and retry for thrown errors</li>
         <li>
           feat!: adds certificate logic to decode subnet and node key paths from the hashtree.
